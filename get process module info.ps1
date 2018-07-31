@@ -6,6 +6,8 @@
 
     Modification History:
 
+    31/07/18  GRL  Added file owner field
+
     @guyrleech 2018
 #>
 
@@ -62,6 +64,7 @@ Get-Process -name $process | select -ExpandProperty modules | select -ExpandProp
 {
     $module = Get-ItemProperty -Path $_
     $result = $module.VersionInfo | Select -Property $selectors 
+    Add-Member -InputObject $result -MemberType NoteProperty -Name 'Owner' -Value ( Get-Acl -Path $_ | Select -ExpandProperty Owner )
     $signing = Get-AuthenticodeSignature -FilePath $module.FullName -ErrorAction SilentlyContinue
     if( $signing )
     {
