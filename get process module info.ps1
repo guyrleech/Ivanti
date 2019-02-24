@@ -8,6 +8,9 @@
 
     31/07/18  GRL  Added file owner field
                    -process parameter can take comma separated list of process names
+    
+    07/02/19  GRL  Added separate folder field
+                   Added ability to query folders rather than processes
 
     @guyrleech 2018
 #>
@@ -60,9 +63,18 @@ Get all modules for all running instances of onedrive.exe, outlook.exe and excel
 
 Param
 (
-    [Parameter(Mandatory=$true)]
+    [Parameter(Mandatory=$true,ParameterSetName='Process')]
     [string[]]$processes ,
+    [Parameter(Mandatory=$true,ParameterSetName='Folders')]
+    [string[]]$folders ,
+    [Parameter(Mandatory=$false,ParameterSetName='Folders')]
+    [switch]$recurse ,
+    [Parameter(Mandatory=$false,ParameterSetName='Folders')]
+    [string[]]$fileTypes = @( '*.exe' , '*.dll' , ' *.ocx' ),
     [string]$filePattern ,
+    [string]$hashAlgorithm = 'SHA1' ,
+    [int]$hashLength = 8MB ,
+    [switch]$nonSessionZero ,
     [string]$csv ,
     [switch]$thisSessionOnly ,
     [int]$sessionId ,
@@ -81,51 +93,176 @@ elseif( $PSBoundParameters[ 'sessionid' ] )
     $thisSessionId = $sessionId
 }
 
-ForEach( $process in $processes )
-{
-    Get-Process -name $process | Where-Object { $thisSessionId -lt 0 -or $_.SessionId -eq $thisSessionId } | Select -ExpandProperty modules | select -ExpandProperty filename| Where-Object { $_ -match $filePattern } | ForEach-Object `
+[hashtable]$runningModules = @{}
+
+[array]$files = @(
+    if( ! [string]::IsNullOrEmpty( $processes ) )
     {
-        $module = Get-ItemProperty -Path $_
+        ForEach( $process in $processes )
+        {
+            Get-Process -name $process | Where-Object { $thisSessionId -lt 0 -or $_.SessionId -eq $thisSessionId } | Select -ExpandProperty modules | select -ExpandProperty filename| Where-Object { $_ -match $filePattern } | ForEach-Object `
+            {
+                $fileName = $_
+                
+                $processes = $runningModules[ $fileName ]
+                if( $processes )
+                {
+                    if( $processes -notcontains $process )
+                    {
+                        $runningModules.Set_Item( $fileName , $processes + $process )
+                    }
+                }
+                else
+                {
+                    $runningModules.Add( $fileName , $process )
+                }
+
+                $fileName
+            }
+        }
+    }
+    else
+    {
+        ForEach( $folder in $folders )
+        {
+            $processList = @( Get-Process | Where-Object { $thisSessionId -lt 0 -or $_.SessionId -eq $thisSessionId } )
+
+            [hashtable]$fileParams = @{
+                'Path' = $folder
+                'File' = $true
+                'Force' = $true
+                'Recurse' = $recurse
+                'ErrorAction' = 'SilentlyContinue'
+                'Include' = $fileTypes }
+
+            Get-ChildItem @fileParams | Where-Object { $_.FullName -match $filePattern } | Select -ExpandProperty FullName
+
+            ## Find all processes currently using any module in this folder so we can report it
+            $processList | ForEach-Object `
+            {
+                $process = $_
+                $process.modules | select -ExpandProperty filename| Where-Object { $_.StartsWith( $folder ) } | ForEach-Object `
+                {
+                    $processes = $runningModules[ $_ ]
+                    if( $processes )
+                    {
+                        if( $processes -notcontains $process.Name )
+                        {
+                            $runningModules.Set_Item( $_ , $processes + $process.Name )
+                        }
+                    }
+                    else
+                    {
+                        $runningModules.Add( $_ , $process.Name )
+                    }
+                }
+            }
+        }
+    } )
+
+ForEach( $file in $files )
+{
+    $module = Get-ItemProperty -Path $file
+    if( $module.Length -and ( $module.Attributes -band [System.IO.FileAttributes]::Offline ) -ne [System.IO.FileAttributes]::Offline )
+    {
         $result = $module.VersionInfo | Select -Property $selectors 
         Add-Member -InputObject $result -NotePropertyMembers `
         @{
-            'Process' = $process
-            'File Owner' = ( Get-Acl -Path $_ | Select -ExpandProperty Owner )
+            'Folder' = Split-Path -Path $file
+            'Process' = $runningModules[ $file ] -join ','
+            'File Owner' = ( Get-Acl -Path $file | Select -ExpandProperty Owner )
         }
-        $signing = Get-AuthenticodeSignature -FilePath $module.FullName -ErrorAction SilentlyContinue
-        if( $signing )
+        try
+        {
+            $signing = Get-AuthenticodeSignature -FilePath $module.FullName -ErrorAction SilentlyContinue
+        }
+        catch
+        {
+            $signing = $null
+        }
+        if( $signing -and $signing.Status -ne 'NotSigned' )
         {
             [bool]$datesValid = $true
-            if( (Get-Date) -lt $signing.SignerCertificate.NotBefore )
+            try
+            {
+                if( (Get-Date) -lt $signing.SignerCertificate.NotBefore )
+                {
+                    $datesValid = $false
+                }
+                if( (Get-Date) -gt $signing.SignerCertificate.NotAfter )
+                {
+                    $datesValid = $false
+                }
+            }
+            catch
             {
                 $datesValid = $false
             }
-            if( (Get-Date) -gt $signing.SignerCertificate.NotAfter )
+            [string]$vendor = $null
+            if( $signing.SignerCertificate.Subject -match '^CN=("?[^"]*"?),' )
             {
-                $datesValid = $false
+                $vendor = $Matches[1]
+            }
+            else
+            {
+                $vendor = ( ( ($signing.SignerCertificate.Subject -split 'CN=')[1] -split ',')[0] )
             }
             Add-Member -InputObject $result -NotePropertyMembers `
             @{
+                'Signed' = 'Yes'
                 'Signing Status' = $signing.Status
                 'Signing Status Message' = $signing.StatusMessage
                 'Signature Type' = $signing.SignatureType
                 'Certificate Subject' = $signing.SignerCertificate.Subject
-                'Certificate Vendor' = ( ( ($signing.SignerCertificate.Subject -split 'CN=')[1] -split ',')[0] )
+                'Certificate Vendor' = $vendor
                 'Certificate Issuer' = $signing.SignerCertificate.Issuer
                 'Certificate Starts' = $signing.SignerCertificate.NotBefore
                 'Certificate Expires' = $signing.SignerCertificate.NotAfter
                 'Certificate In Date' = $datesValid
             }
         }
+        else
+        {
+            Add-Member -InputObject $result -MemberType NoteProperty -Name 'Signed' -Value 'No'
+        }
+        if( Get-Command -Name Get-FileHash -ErrorAction SilentlyContinue )
+        {
+            $fileStream = New-Object -TypeName System.IO.FileStream -ArgumentList ($file, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read)
+            $fileReader = New-Object -TypeName System.IO.BinaryReader -ArgumentList $fileStream
+            [byte[]]$readBytes = $fileReader.ReadBytes( $hashLength )
+            $tempFileName = [System.IO.Path]::GetTempFileName()
+            $fileReader.Dispose()
+            $fileStream.Dispose()
+            
+            $fileWriter = New-Object System.IO.FileStream($tempFileName, [System.IO.FileMode]'Create', [System.IO.FileAccess]'Write')
+            $fileWriter.Write( $readBytes , 0 , $readBytes.Count )
+            $fileWriter.Dispose()
+
+            Add-Member -InputObject $result -MemberType NoteProperty -Name 'Partial Hash' -Value (Get-FileHash -Path $tempFileName -Algorithm $hashAlgorithm | Select -ExpandProperty 'Hash')
+            Remove-Item -Path $tempFileName -Force
+        }
         try
         {
-            $modules.Add( $_ , $result )
+            $modules.Add( $file , $result )
         }
         catch{} ## duplicate
     }
 }
 
-[string]$status = "Got $($modules.Count) modules for process $($processes -join ',') matching $filePattern"
+[string]$status = "Got $($modules.Count) modules "
+if( $PSBoundParameters[ 'processes' ] )
+{
+    $status += "for process $($processes -join ',')"
+}
+else
+{
+    $status += "for folders `"$($folders -join '",')`""
+}
+
+if( ! [string]::IsNullOrEmpty( $filePattern ) )
+{
+    $status += " matching $filePattern"
+}
 
 Write-Verbose $status
 
@@ -141,4 +278,3 @@ else
         $selected | clip.exe
     }
 }
-
